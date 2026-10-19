@@ -1,0 +1,20 @@
+name: BudsLink
+options:
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  BudsLink:
+    type: application
+    platform: iOS
+    sources: [BudsLink]
+    info:
+      path: BudsLink/Info.plist
+      properties:
+        CFBundleDisplayName: BudsLink
+        UILaunchScreen: {}
+        NSBluetoothAlwaysUsageDescription: BudsLink uses Bluetooth to find and monitor your earbuds.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.budslink
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
