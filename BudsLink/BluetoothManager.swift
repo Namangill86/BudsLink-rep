@@ -35,6 +35,14 @@ final class BluetoothManager: NSObject, ObservableObject {
         rssiTimer?.invalidate()
     }
 
+    /// Catches earbuds already connected to iOS that expose the BLE Battery Service.
+    func attachToConnected() {
+        guard central.state == .poweredOn, peripheral == nil else { return }
+        for p in central.retrieveConnectedPeripherals(withServices: [batteryService]) where isTarget(p.name) {
+            peripheral = p; p.delegate = self; state = .connecting; central.connect(p)
+        }
+    }
+
     private func isTarget(_ name: String?) -> Bool {
         guard let n = name?.lowercased() else { return false }
         return n.contains("oneplus buds 3") || n.contains("buds 3 pro")
@@ -44,7 +52,7 @@ final class BluetoothManager: NSObject, ObservableObject {
 extension BluetoothManager: CBCentralManagerDelegate, CBPeripheralDelegate {
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
         switch c.state {
-        case .poweredOn: state = .idle; errorMessage = nil
+        case .poweredOn: state = .idle; errorMessage = nil; attachToConnected()
         case .unauthorized:
             state = .unauthorized
             errorMessage = "Bluetooth permission denied. Enable it in Settings > BudsLink."
@@ -87,7 +95,7 @@ extension BluetoothManager: CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) {
-        if ch.uuid == batteryLevel, let b = ch.value?.first { batteryPercent = Int(b); lastSeen = Date() }
+        if ch.uuid == batteryLevel, let b = ch.value?.first { batteryPercent = Int(b); UserDefaults.standard.set(Int(b), forKey: "lastBattery"); lastSeen = Date() }
     }
 
     func peripheral(_ p: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {

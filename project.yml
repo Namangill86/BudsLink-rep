@@ -12,6 +12,8 @@ targets:
       properties:
         CFBundleDisplayName: BudsLink
         UILaunchScreen: {}
+        NSMicrophoneUsageDescription: BudsLink uses the microphone for Live Listen and translation. Audio is never recorded or stored.
+        UIBackgroundModes: [audio]
         NSBluetoothAlwaysUsageDescription: BudsLink uses Bluetooth to find and monitor your earbuds.
     settings:
       base:
