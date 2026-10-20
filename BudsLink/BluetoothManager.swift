@@ -12,6 +12,7 @@ final class BluetoothManager: NSObject, ObservableObject {
     @Published var rssi: Int?
     @Published var lastSeen: Date?
     @Published var errorMessage: String?
+    @Published var gattDump: [String] = []      // read-only report of what the buds expose over BLE
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
@@ -45,7 +46,7 @@ final class BluetoothManager: NSObject, ObservableObject {
 
     private func isTarget(_ name: String?) -> Bool {
         guard let n = name?.lowercased() else { return false }
-        return n.contains("oneplus buds 3") || n.contains("buds 3 pro")
+        return n.contains("buds pro 3") || n.contains("buds 3 pro") || n.contains("oneplus buds 3")
     }
 }
 
@@ -72,7 +73,7 @@ extension BluetoothManager: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
         state = .connected; lastSeen = Date()
-        p.discoverServices([batteryService])
+        gattDump = []; p.discoverServices(nil)
         rssiTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in p.readRSSI() }
     }
 
@@ -82,13 +83,15 @@ extension BluetoothManager: CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        for s in p.services ?? [] where s.uuid == batteryService {
-            p.discoverCharacteristics([batteryLevel], for: s)
+        for s in p.services ?? [] {
+            gattDump.append("Service \(s.uuid.uuidString)")
+            p.discoverCharacteristics(nil, for: s)
         }
         // No battery service -> batteryPercent stays nil and the UI says "Not reported".
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) {
+        for ch in s.characteristics ?? [] { gattDump.append("  Char \(ch.uuid.uuidString) props=\(ch.properties.rawValue)") }
         for ch in s.characteristics ?? [] where ch.uuid == batteryLevel {
             p.readValue(for: ch); p.setNotifyValue(true, for: ch)
         }

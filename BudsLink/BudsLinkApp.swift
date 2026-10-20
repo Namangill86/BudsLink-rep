@@ -5,6 +5,7 @@ import SwiftUI
     @StateObject private var audio = AudioManager()
     @StateObject private var monitor = ConnectionMonitor()
     @StateObject private var live = LiveListenManager()
+    @StateObject private var noise = NoiseControlManager()
 
     var body: some Scene {
         WindowGroup {
@@ -22,7 +23,7 @@ import SwiftUI
             }
             .animation(.spring(response: 0.5, dampingFraction: 0.8), value: monitor.showPopup)
             .environmentObject(bt).environmentObject(audio)
-            .environmentObject(monitor).environmentObject(live)
+            .environmentObject(monitor).environmentObject(live).environmentObject(noise)
             .onAppear { monitor.onConnect = { bt.attachToConnected() }; bt.attachToConnected() }
         }
     }
@@ -31,6 +32,7 @@ import SwiftUI
 struct ConnectPopup: View {
     let name: String; let battery: Int?
     @State private var pulse = false
+    @EnvironmentObject var noise: NoiseControlManager
     var body: some View {
         HStack(spacing: 14) {
             Image(systemName: "earbuds").font(.largeTitle).scaleEffect(pulse ? 1.12 : 0.95)
@@ -40,6 +42,12 @@ struct ConnectPopup: View {
                 Text("Connected").font(.subheadline).foregroundStyle(.green)
                 Text(battery.map { "Battery \($0)%" } ?? "Battery not reported by earbuds")
                     .font(.caption).foregroundStyle(.secondary)
+                if noise.isSupported {
+                    HStack { ForEach(noise.supportedModes, id: \.self) { m in
+                        Text("\(m.icon) \(m.rawValue)").font(.caption2).padding(6)
+                            .background(noise.mode == m ? Color.accentColor : Color.secondary.opacity(0.2), in: Capsule())
+                            .foregroundStyle(noise.mode == m ? Color.white : Color.primary) } }
+                }
             }
             Spacer()
         }
@@ -51,6 +59,7 @@ struct ConnectPopup: View {
 struct DashboardView: View {
     @EnvironmentObject var bt: BluetoothManager
     @EnvironmentObject var monitor: ConnectionMonitor
+    @EnvironmentObject var noise: NoiseControlManager
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -67,11 +76,12 @@ struct DashboardView: View {
                     Button("Scan for battery (BLE)") {
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred(); bt.startScan()
                     }.buttonStyle(.borderedProminent)
-                    CapabilityRow(cap: CapabilityRegistry.get("anc"))
+                    NoiseControlCard()
                     Text("Last seen: \(bt.lastSeen?.formatted(date: .omitted, time: .shortened) ?? "never"). Not Apple's Find My network.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }.padding()
             }.navigationTitle("BudsLink")
+                .onChange(of: bt.gattDump) { _, new in noise.detect(gatt: new) }
         }
     }
 }
