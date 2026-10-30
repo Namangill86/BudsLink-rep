@@ -4,19 +4,22 @@ import SwiftUI
     @StateObject private var bt = BluetoothManager()
     @StateObject private var audio = AudioManager()
     @StateObject private var monitor = ConnectionMonitor()
-    @StateObject private var live = LiveListenManager()
+      @StateObject private var live = LiveListenManager()
     @StateObject private var noise = NoiseControlManager()
+    @StateObject private var hub = EarbudHub()
 
     var body: some Scene {
         WindowGroup {
             ZStack(alignment: .top) {
-                TabView {
+              TabView {
                     DashboardView().tabItem { Label("Buds", systemImage: "earbuds") }
                     LiveListenView().tabItem { Label("Live Listen", systemImage: "ear.badge.waveform") }
                     EQView().tabItem { Label("EQ", systemImage: "slider.vertical.3") }
                     CompatibilityView().tabItem { Label("Features", systemImage: "checklist") }
+                    EarbudStatusView(hub: hub).tabItem { Label("Earbuds", systemImage: "antenna.radiowaves.left.and.right") }
                 }
                 if monitor.showPopup {
+
                     ConnectPopup(name: monitor.deviceName ?? "Earbuds", battery: bt.batteryPercent)
                         .transition(.move(edge: .top).combined(with: .opacity)).zIndex(1)
                 }
