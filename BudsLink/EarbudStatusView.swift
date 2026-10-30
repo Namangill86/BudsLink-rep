@@ -105,7 +105,7 @@ struct EarbudStatusView: View {
             case .failed(let message):
                 Text("Couldn't check noise control: \(message)").foregroundStyle(.secondary)
             case .supported:
-                Picker("Mode", selection: Binding<NoiseMode?>(
+                Picker("Mode", selection: Binding<EarbudNoiseMode?>(
                     get: { hub.ble.currentNoiseMode },
                     set: { if let mode = $0 { hub.ble.setNoiseMode(mode) } }
                 )) {

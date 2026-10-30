@@ -36,8 +36,8 @@ final class BLEEarbudSession: NSObject, ObservableObject {
     @Published private(set) var services: [GATTServiceInfo] = []
     @Published private(set) var discoveryComplete = false
     @Published private(set) var noiseAvailability: FeatureAvailability = .checking
-    @Published private(set) var noiseModes: [NoiseMode] = []
-    @Published private(set) var currentNoiseMode: NoiseMode?
+    @Published private(set) var noiseModes: [EarbudNoiseMode] = []
+    @Published private(set) var currentNoiseMode: EarbudNoiseMode?
     @Published private(set) var rssi: Int?
     @Published private(set) var lastSeen: Date?
     @Published private(set) var errorMessage: String?
@@ -67,7 +67,7 @@ final class BLEEarbudSession: NSObject, ObservableObject {
     private var scanStop: DispatchWorkItem?
     private var rssiTimer: Timer?
     private var pendingServices = 0
-    private var provider: NoiseControlProvider?
+    private var provider: EarbudNoiseProvider?
 
     private struct BatteryChar {
         var percent: Int?
@@ -110,7 +110,7 @@ final class BLEEarbudSession: NSObject, ObservableObject {
         connect(p)
     }
 
-    func setNoiseMode(_ mode: NoiseMode) {
+    func setNoiseMode(_ mode: EarbudNoiseMode) {
         provider?.set(mode)        // no optimistic update: UI follows what the device reports
     }
 
@@ -214,7 +214,7 @@ final class BLEEarbudSession: NSObject, ObservableObject {
     private func attachNoiseControl() {
         guard let p = peripheral else { return }
         let all = p.services ?? []
-        for providerType in NoiseControlRegistry.providers() where providerType.matches(services: all) {
+        for providerType in EarbudNoiseRegistry.providers() where providerType.matches(services: all) {
             let instance = providerType.init(peripheral: p, services: all)
             instance.onModeChange = { [weak self] mode in self?.currentNoiseMode = mode }
             provider = instance

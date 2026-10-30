@@ -38,7 +38,7 @@ enum FeatureAvailability: Equatable {
 
 // MARK: - Noise control
 
-enum NoiseMode: String, CaseIterable, Identifiable {
+enum EarbudNoiseMode: String, CaseIterable, Identifiable {
     case noiseCancellation = "Noise Cancellation"
     case off = "Off"
     case transparency = "Transparency"
@@ -60,27 +60,27 @@ enum NoiseMode: String, CaseIterable, Identifiable {
 /// so every implementation is specific to one manufacturer's GATT layout. Add a conformance only
 /// when you have the vendor's documentation, or have confirmed the service/characteristic UUIDs
 /// in the app's Bluetooth Report on the real earbuds. Do NOT guess UUIDs.
-protocol NoiseControlProvider: AnyObject {
+protocol EarbudNoiseProvider: AnyObject {
     /// True only when the discovered GATT layout is exactly the interface this provider implements.
     static func matches(services: [CBService]) -> Bool
     init(peripheral: CBPeripheral, services: [CBService])
 
-    var supportedModes: [NoiseMode] { get }
+    var supportedModes: [EarbudNoiseMode] { get }
     /// Called with the mode the DEVICE reports (read-back or notification), never with an assumed one.
-    var onModeChange: ((NoiseMode?) -> Void)? { get set }
+    var onModeChange: ((EarbudNoiseMode?) -> Void)? { get set }
 
     /// Subscribe and/or read the current state.
     func start()
     /// Write the requested mode. The UI only changes when the device reports the new mode back.
-    func set(_ mode: NoiseMode)
+    func set(_ mode: EarbudNoiseMode)
     /// Offer every characteristic update; return true if it was consumed.
     func handle(update characteristic: CBCharacteristic) -> Bool
 }
 
-enum NoiseControlRegistry {
+enum EarbudNoiseRegistry {
     /// Intentionally empty: no vendor interface is registered, so the app will truthfully report
     /// "Noise Control is not exposed by this device." Register real providers here.
-    static func providers() -> [any NoiseControlProvider.Type] { [] }
+    static func providers() -> [any EarbudNoiseProvider.Type] { [] }
 }
 
 // MARK: - GATT report types
