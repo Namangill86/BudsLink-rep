@@ -2,13 +2,14 @@ import CoreBluetooth
 import Combine
 import Foundation
 
-/// Discovers, connects to, and interrogates the earbuds' BLE (GATT) side.
+/// The single authoritative BLE layer: finds, connects to, and interrogates the earbuds' GATT side.
 ///
-/// Pipeline:  find peripheral -> connect -> discover ALL services/characteristics ->
-///            decide capabilities from what is really there -> read/subscribe -> publish.
+/// Pipeline:  find peripheral -> connect -> discover ALL services/characteristics (logged) ->
+///            decide capabilities from what is really there -> subscribe -> start the OPO control session.
 ///
-/// Nothing here is hardcoded to a device model: the peripheral is matched against the NAME OF THE
-/// CURRENT SYSTEM AUDIO ROUTE (real evidence), or chosen by the user from real scan results.
+/// The peripheral is found by (a) services it exposes, (b) a known device profile name, or (c) the name of the
+/// current audio route. Nothing is assumed from a successful connection: whether control works is reported
+/// separately by `opo.state`.
 ///
 /// LIVE LISTEN SAFETY: no AVAudioSession / AVAudioEngine calls anywhere in this file.
 final class BLEEarbudSession: NSObject, ObservableObject {
@@ -35,12 +36,12 @@ final class BLEEarbudSession: NSObject, ObservableObject {
     @Published private(set) var deviceInfo: [String: String] = [:]
     @Published private(set) var services: [GATTServiceInfo] = []
     @Published private(set) var discoveryComplete = false
-    @Published private(set) var noiseAvailability: FeatureAvailability = .checking
-    @Published private(set) var noiseModes: [EarbudNoiseMode] = []
-    @Published private(set) var currentNoiseMode: EarbudNoiseMode?
     @Published private(set) var rssi: Int?
     @Published private(set) var lastSeen: Date?
     @Published private(set) var errorMessage: String?
+
+    /// The one OPO control session (handshake, commands, replies).
+    let opo = OPOSession()
 
     static let infoOrder = ["Manufacturer", "Model", "Firmware", "Hardware", "Software", "Serial"]
 
@@ -49,14 +50,15 @@ final class BLEEarbudSession: NSObject, ObservableObject {
     private static let deviceInfoService = CBUUID(string: "180A")
     private static let batteryLevel = CBUUID(string: "2A19")
     private static let batteryPowerState = CBUUID(string: "2A1A")
-    private static let userDescription = CBUUID(string: "2901")        // Characteristic User Description
-    private static let presentationFormat = CBUUID(string: "2904")     // Characteristic Presentation Format
+    private static let userDescription = CBUUID(string: "2901")
+    private static let presentationFormat = CBUUID(string: "2904")
     private static let infoLabels: [CBUUID: String] = [
         CBUUID(string: "2A29"): "Manufacturer", CBUUID(string: "2A24"): "Model",
         CBUUID(string: "2A26"): "Firmware",     CBUUID(string: "2A27"): "Hardware",
         CBUUID(string: "2A28"): "Software",     CBUUID(string: "2A25"): "Serial"
     ]
     private static let savedKey = "BudsLink.lastPeripheralID"
+    private static let maxConnectAttempts = 4
 
     // MARK: Private state
     private var central: CBCentralManager!
@@ -67,7 +69,15 @@ final class BLEEarbudSession: NSObject, ObservableObject {
     private var scanStop: DispatchWorkItem?
     private var rssiTimer: Timer?
     private var pendingServices = 0
-    private var provider: EarbudNoiseProvider?
+    private var connectAttempts = 0
+
+    // OPO bookkeeping
+    private var opoWriteChar: CBCharacteristic?
+    private var opoInboundChars: [ObjectIdentifier: String] = [:]   // notify characteristics we listen on -> short label
+    private var opoCriticalNotify = Set<ObjectIdentifier>()         // notify characteristics inside the OPO service itself
+    private var pendingNotify = Set<ObjectIdentifier>()
+    private var opoProfile: OPODeviceProfile?
+    private var opoStartScheduled = false
 
     private struct BatteryChar {
         var percent: Int?
@@ -83,6 +93,7 @@ final class BLEEarbudSession: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        opo.transport = self
         central = CBCentralManager(delegate: self, queue: .main,
                                    options: [CBCentralManagerOptionShowPowerAlertKey: false])
     }
@@ -101,17 +112,29 @@ final class BLEEarbudSession: NSObject, ObservableObject {
         if let p = peripheral { central.cancelPeripheralConnection(p) }
         peripheral = nil
         clearDeviceData()
+        connectAttempts = 0
         wantConnection = true
         locate()
     }
 
     func select(_ candidate: Candidate) {
         guard let p = known[candidate.id] else { return }
+        connectAttempts = 0
         connect(p)
     }
 
-    func setNoiseMode(_ mode: EarbudNoiseMode) {
-        provider?.set(mode)        // no optimistic update: UI follows what the device reports
+    /// User-initiated "Retry" for the control session: re-runs discovery on a live link, or searches again.
+    func retryControl() {
+        connectAttempts = 0
+        errorMessage = nil
+        if case .connected = connection, let p = peripheral {
+            OPOLog.shared.add("BLE", "Retry requested: discovering services again")
+            clearDeviceData()
+            p.discoverServices(nil)
+        } else {
+            wantConnection = true
+            locate()
+        }
     }
 
     // MARK: Finding the peripheral
@@ -122,6 +145,10 @@ final class BLEEarbudSession: NSObject, ObservableObject {
         return t == o || t.contains(o) || o.contains(t)
     }
 
+    private func isKnownDevice(_ name: String?) -> Bool {
+        OPODeviceProfile.match(bleName: name) != nil
+    }
+
     private func locate() {
         guard wantConnection, central.state == .poweredOn else { return }
         if let p = peripheral, p.state == .connected || p.state == .connecting { return }
@@ -130,30 +157,38 @@ final class BLEEarbudSession: NSObject, ObservableObject {
         //    so reconnects work without restarting the app.
         if let id = UserDefaults.standard.string(forKey: Self.savedKey).flatMap(UUID.init(uuidString:)),
            let saved = central.retrievePeripherals(withIdentifiers: [id]).first,
-           targetName == nil || nameMatches(saved.name) {
+           targetName == nil || nameMatches(saved.name) || isKnownDevice(saved.name) {
+            OPOLog.shared.add("BLE", "Reconnecting to the remembered earbuds")
             connect(saved, pending: true)
             return
         }
 
-        // 2. Peripherals the system already holds a BLE link to.
-        let systemConnected = central.retrieveConnectedPeripherals(
-            withServices: [Self.batteryService, Self.deviceInfoService])
+        // 2. Peripherals the system already holds a BLE link to, found by the services they expose.
+        let probes = [OPO.service, Self.batteryService, Self.deviceInfoService]
+        let systemConnected = central.retrieveConnectedPeripherals(withServices: probes)
         for p in systemConnected { known[p.identifier] = p }
-        if let match = systemConnected.first(where: { nameMatches($0.name) }) {
+        let connectedNames = systemConnected.map { $0.name ?? "unnamed" }.joined(separator: ", ")
+        OPOLog.shared.add("BLE", "System-connected peripherals with known services: \(connectedNames)")
+        if let match = systemConnected.first(where: { nameMatches($0.name) || isKnownDevice($0.name) }) {
+            OPOLog.shared.add("BLE", "Found: " + (match.name ?? "earbuds"))
             connect(match)
             return
         }
 
-        // 3. Scan, but only when we have a real audio-route name to look for.
+        // 3. Scan, but only when there is a real audio route (or a known model) to look for.
         guard targetName != nil else { connection = .idle; return }
+        OPOLog.shared.add("BLE", "Scanning...")
         connection = .searching
         central.scanForPeripherals(withServices: nil,
                                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         scanStop?.cancel()
         let stop = DispatchWorkItem { [weak self] in
-            guard let self else { return }
+            guard let self = self else { return }
             self.central.stopScan()
-            if self.connection == .searching { self.connection = .idle }
+            if self.connection == .searching {
+                OPOLog.shared.add("BLE", "Scan ended without finding the earbuds")
+                self.connection = .idle
+            }
         }
         scanStop = stop
         DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: stop)
@@ -168,6 +203,7 @@ final class BLEEarbudSession: NSObject, ObservableObject {
         errorMessage = nil
         let name = p.name ?? targetName ?? "Earbuds"
         connection = pending ? .waiting(name) : .connecting(name)
+        OPOLog.shared.add("BLE", pending ? "Waiting for \(name) to reconnect" : "Connecting to \(name)")
         central.connect(p, options: nil)
     }
 
@@ -180,14 +216,17 @@ final class BLEEarbudSession: NSObject, ObservableObject {
         batteries = []
         deviceInfo = [:]
         services = []
-        provider = nil
-        noiseModes = []
-        currentNoiseMode = nil
         rssi = nil
         discoveryComplete = false
         pendingServices = 0
         batteryAvailability = .checking
-        noiseAvailability = .checking
+        opoWriteChar = nil
+        opoInboundChars = [:]
+        opoCriticalNotify = []
+        pendingNotify = []
+        opoProfile = nil
+        opoStartScheduled = false
+        opo.markUnavailable("Waiting for the Bluetooth LE link")
     }
 
     private func startRSSITimer() {
@@ -208,22 +247,47 @@ final class BLEEarbudSession: NSObject, ObservableObject {
         discoveryComplete = true
         batteryAvailability = batteryChars.isEmpty ? .notExposed : .supported
         publishBatteries()
-        attachNoiseControl()
+        configureOPO()
     }
 
-    private func attachNoiseControl() {
+    /// Decides, from what the earbuds really expose, whether the OPO control session can exist.
+    private func configureOPO() {
         guard let p = peripheral else { return }
         let all = p.services ?? []
-        for providerType in EarbudNoiseRegistry.providers() where providerType.matches(services: all) {
-            let instance = providerType.init(peripheral: p, services: all)
-            instance.onModeChange = { [weak self] mode in self?.currentNoiseMode = mode }
-            provider = instance
-            noiseModes = instance.supportedModes
-            noiseAvailability = .supported
-            instance.start()
+        let uuids = all.map { $0.uuid.uuidString }
+        let uuidList = uuids.isEmpty ? "none" : uuids.joined(separator: ", ")
+        OPOLog.shared.add("BLE", "Services: \(uuidList)")
+
+        guard all.contains(where: { $0.uuid == OPO.service }) else {
+            opo.markUnavailable("The earbuds' OPO control service (0000079A-D102-11E1-9B23-00025B00A5A5) was not found on this BLE connection. Services found: \(uuidList). Possible reasons: this connection only offers it over Classic Bluetooth (RFCOMM), which iOS apps cannot open without Apple's MFi program, or iOS does not expose it for this connection. The earbuds can still support ANC; this app just cannot reach the control channel.")
             return
         }
-        noiseAvailability = .notExposed
+        guard let profile = OPODeviceProfile.match(bleName: p.name) else {
+            opo.markUnavailable("The OPO control service is present, but \"\(p.name ?? "unnamed")\" has no verified command profile, so no commands are sent. The Bluetooth Report lists everything found.")
+            return
+        }
+        guard let writeChar = opoWriteChar, writeChar.properties.contains(.writeWithoutResponse) else {
+            opo.markUnavailable("The OPO service is present, but its write characteristic (0100079A…) is missing or does not allow write-without-response, which the protocol requires.")
+            return
+        }
+        guard !opoCriticalNotify.isEmpty else {
+            opo.markUnavailable("The OPO service is present, but it has no notification characteristic, so replies could not be received and no commands are sent.")
+            return
+        }
+        OPOLog.shared.add("BLE", "OPO service verified; write characteristic supports write-without-response")
+        opoProfile = profile
+        opo.markStarting("Subscribing to notifications")
+        maybeStartOPO()
+    }
+
+    private func maybeStartOPO() {
+        guard let profile = opoProfile, pendingNotify.isEmpty, !opoStartScheduled else { return }
+        opoStartScheduled = true
+        OPOLog.shared.add("BLE", "Subscribed to notifications")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self = self, self.opoStartScheduled, case .connected = self.connection else { return }
+            self.opo.begin(profile: profile)
+        }
     }
 
     private func serviceKey(of c: CBCharacteristic) -> ObjectIdentifier? {
@@ -259,6 +323,15 @@ final class BLEEarbudSession: NSObject, ObservableObject {
 
     // MARK: Report
 
+    var opoStateDescription: String {
+        switch opo.state {
+        case .unavailable(let reason): return "unavailable: \(reason)"
+        case .starting(let step):      return "starting: \(step)"
+        case .ready:                   return "ready"
+        case .failed(let reason):      return "failed: \(reason)"
+        }
+    }
+
     func reportText(audioRoute: String?) -> String {
         var l: [String] = []
         l.append("BudsLink Bluetooth report")
@@ -268,12 +341,8 @@ final class BLEEarbudSession: NSObject, ObservableObject {
         l.append("BLE link: \(String(describing: connection))")
         if let rssi = rssi { l.append("RSSI: \(rssi) dBm") }
         l.append("Discovery complete: \(discoveryComplete)")
-        l.append("Battery: \(String(describing: batteryAvailability))")
-        for b in batteries {
-            l.append("  \(b.role.title): \(b.percent.map { "\($0)%" } ?? "no value yet")"
-                     + (b.charging == true ? " (charging)" : ""))
-        }
-        l.append("Noise control: \(String(describing: noiseAvailability))")
+        l.append("OPO control session: \(opoStateDescription)")
+        l.append("Standard battery service: \(String(describing: batteryAvailability))")
         for (k, v) in deviceInfo.sorted(by: { $0.key < $1.key }) { l.append("\(k): \(v)") }
         l.append("")
         l.append("GATT services (\(services.count)):")
@@ -284,7 +353,22 @@ final class BLEEarbudSession: NSObject, ObservableObject {
             }
         }
         if let errorMessage = errorMessage { l.append(""); l.append("Last error: \(errorMessage)") }
+        l.append("")
+        l.append("Event log (the REGISTER token is never recorded; review before sharing):")
+        l.append(OPOLog.shared.text)
         return l.joined(separator: "\n")
+    }
+}
+
+// MARK: - OPOTransport
+
+extension BLEEarbudSession: OPOTransport {
+    /// The only write in the whole app: write-without-response to the verified OPO write characteristic.
+    func opoWrite(_ data: Data) -> Bool {
+        guard let p = peripheral, p.state == .connected, let c = opoWriteChar else { return false }
+        guard p.canSendWriteWithoutResponse else { return false }
+        p.writeValue(data, for: c, type: .withoutResponse)
+        return true
     }
 }
 
@@ -314,9 +398,10 @@ extension BLEEarbudSession: CBCentralManagerDelegate {
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? p.name
         known[p.identifier] = p
-        if nameMatches(name) {
+        if nameMatches(name) || isKnownDevice(name) {
+            OPOLog.shared.add("BLE", "Found: " + (name ?? "earbuds"))
             connect(p)
-        } else if let name, !name.isEmpty, !candidates.contains(where: { $0.id == p.identifier }),
+        } else if let name = name, !name.isEmpty, !candidates.contains(where: { $0.id == p.identifier }),
                   candidates.count < 20 {
             candidates.append(Candidate(id: p.identifier, name: name))
         }
@@ -325,9 +410,15 @@ extension BLEEarbudSession: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didConnect p: CBPeripheral) {
         guard p.identifier == peripheral?.identifier else { return }
         UserDefaults.standard.set(p.identifier.uuidString, forKey: Self.savedKey)
+        connectAttempts = 0
         clearDeviceData()
+        opo.resetForNewConnection()
         connection = .connected(p.name ?? targetName ?? "Earbuds")
         lastSeen = Date()
+        let shownName = p.name ?? "earbuds"
+        OPOLog.shared.add("BLE", "Peripheral connected: " + shownName)
+        OPOLog.shared.add("BLE", "Discovering services...")
+        opo.markUnavailable("Discovering services…")
         p.discoverServices(nil)       // nil: discover everything, then decide capabilities from the result
         p.readRSSI()
         startRSSITimer()
@@ -335,16 +426,27 @@ extension BLEEarbudSession: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         guard p.identifier == peripheral?.identifier else { return }
+        let detail = error.map { ": " + $0.localizedDescription } ?? ""
+        OPOLog.shared.add("BLE", "Disconnected" + detail)
         clearDeviceData()
+        opo.markUnavailable("The earbuds disconnected from BLE (case closed, out of range, or another app took the connection).")
         guard wantConnection else { connection = .idle; return }
         connection = .waiting(p.name ?? targetName ?? "Earbuds")
-        central.connect(p, options: nil)   // stays pending; fires when the earbuds return
+        central.connect(p, options: nil)   // stays pending; fires when the earbuds return (not a retry loop)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        errorMessage = error?.localizedDescription ?? "Couldn't connect to the earbuds."
+        connectAttempts += 1
+        let reason = error?.localizedDescription ?? "Couldn't connect to the earbuds."
+        OPOLog.shared.add("BLE", "Connect failed (\(connectAttempts) of \(Self.maxConnectAttempts)): \(reason)")
+        errorMessage = reason
         connection = .idle
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.locate() }
+        guard connectAttempts < Self.maxConnectAttempts else {
+            errorMessage = "\(reason) Gave up after \(Self.maxConnectAttempts) tries. Tap Retry."
+            return
+        }
+        let delay = Double(connectAttempts) * 2
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.locate() }
     }
 }
 
@@ -353,18 +455,21 @@ extension BLEEarbudSession: CBCentralManagerDelegate {
 extension BLEEarbudSession: CBPeripheralDelegate {
 
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        if let error {
+        if let error = error {
+            OPOLog.shared.add("BLE", "Service discovery failed: \(error.localizedDescription)")
             batteryAvailability = .failed(error.localizedDescription)
-            noiseAvailability = .failed(error.localizedDescription)
+            opo.markUnavailable("Service discovery failed: \(error.localizedDescription). Close other apps that control the earbuds and tap Retry.")
             return
         }
         let list = p.services ?? []
         pendingServices = list.count
         if list.isEmpty { finishDiscovery(); return }
+        OPOLog.shared.add("BLE", "Discovering characteristics...")
         list.forEach { p.discoverCharacteristics(nil, for: $0) }
     }
 
     func peripheral(_ p: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+        OPOLog.shared.add("BLE", "Services changed; discovering again")
         clearDeviceData()
         p.discoverServices(nil)
     }
@@ -374,9 +479,12 @@ extension BLEEarbudSession: CBPeripheralDelegate {
             pendingServices -= 1
             if pendingServices <= 0 && !discoveryComplete { finishDiscovery() }
         }
-        if let error { errorMessage = error.localizedDescription; return }
+        if let error = error { errorMessage = error.localizedDescription; return }
 
         let chars = service.characteristics ?? []
+        for c in chars {
+            OPOLog.shared.add("BLE", "Service \(service.uuid.uuidString) characteristic \(c.uuid.uuidString) [\(GATTNames.properties(of: c).joined(separator: ","))]")
+        }
         services.append(GATTServiceInfo(
             id: "\(ObjectIdentifier(service))",
             uuid: service.uuid.uuidString,
@@ -387,6 +495,27 @@ extension BLEEarbudSession: CBPeripheralDelegate {
                                        name: GATTNames.characteristics[$0.uuid.uuidString],
                                        properties: GATTNames.properties(of: $0))
             }))
+
+        // OPO control service + vendor telemetry service: SUBSCRIBE to every notify/indicate characteristic
+        // (replies can arrive on either service). Only the verified OPO write characteristic is ever written.
+        let isOPOService = service.uuid == OPO.service
+        if isOPOService || OPO.isTelemetryService(service.uuid) {
+            if isOPOService { OPOLog.shared.add("BLE", "OPO service found: \(service.uuid.uuidString)") }
+            for c in chars {
+                let id = ObjectIdentifier(c)
+                if c.properties.contains(.notify) || c.properties.contains(.indicate) {
+                    opoInboundChars[id] = String(c.uuid.uuidString.prefix(8))
+                    pendingNotify.insert(id)
+                    if isOPOService { opoCriticalNotify.insert(id) }
+                    OPOLog.shared.add("BLE", "Notify characteristic found: \(String(c.uuid.uuidString.prefix(8)))")
+                    p.setNotifyValue(true, for: c)
+                }
+                if isOPOService && c.uuid == OPO.writeCharacteristic {
+                    opoWriteChar = c
+                    OPOLog.shared.add("BLE", "Write characteristic found")
+                }
+            }
+        }
 
         for c in chars {
             switch c.uuid {
@@ -412,12 +541,18 @@ extension BLEEarbudSession: CBPeripheralDelegate {
     }
 
     func peripheral(_ p: CBPeripheral, didUpdateValueFor c: CBCharacteristic, error: Error?) {
-        if let error {
+        if let error = error {
+            OPOLog.shared.add("BLE", "Read/notify failed on \(String(c.uuid.uuidString.prefix(8))): \(error.localizedDescription)")
             errorMessage = "Read failed (\(c.uuid.uuidString)): \(error.localizedDescription)"
             return
         }
         lastSeen = Date()
-        if provider?.handle(update: c) == true { return }
+
+        // OPO / vendor notifications go straight to the protocol layer.
+        if let label = opoInboundChars[ObjectIdentifier(c)] {
+            if let data = c.value { opo.handleInbound(data, source: label) }
+            return
+        }
         guard let data = c.value else { return }
 
         switch c.uuid {
@@ -449,7 +584,7 @@ extension BLEEarbudSession: CBPeripheralDelegate {
 
     func peripheral(_ p: CBPeripheral, didUpdateValueFor d: CBDescriptor, error: Error?) {
         let owner: CBCharacteristic? = d.characteristic
-        guard error == nil, let owner else { return }
+        guard error == nil, let owner = owner else { return }
         let key = ObjectIdentifier(owner)
         guard batteryChars[key] != nil else { return }
 
@@ -464,7 +599,21 @@ extension BLEEarbudSession: CBPeripheralDelegate {
     }
 
     func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor c: CBCharacteristic, error: Error?) {
-        if let error { errorMessage = "Notify failed (\(c.uuid.uuidString)): \(error.localizedDescription)" }
+        let id = ObjectIdentifier(c)
+        guard opoInboundChars[id] != nil else {
+            if let error = error { errorMessage = "Notify failed (\(c.uuid.uuidString)): \(error.localizedDescription)" }
+            return
+        }
+        pendingNotify.remove(id)
+        if let error = error {
+            OPOLog.shared.add("BLE", "Subscribe failed on \(String(c.uuid.uuidString.prefix(8))): \(error.localizedDescription)")
+            if opoCriticalNotify.contains(id) {
+                opoProfile = nil
+                opo.markUnavailable("Could not subscribe to the earbuds' reply channel (\(c.uuid.uuidString)): \(error.localizedDescription). Replies could not be received, so no commands are sent.")
+            }
+            return
+        }
+        maybeStartOPO()
     }
 
     func peripheral(_ p: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {

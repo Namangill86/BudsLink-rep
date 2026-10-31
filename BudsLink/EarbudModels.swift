@@ -36,53 +36,6 @@ enum FeatureAvailability: Equatable {
     case failed(String)      // discovery itself failed, so we can't say either way
 }
 
-// MARK: - Noise control
-
-enum EarbudNoiseMode: String, CaseIterable, Identifiable {
-    case noiseCancellation = "Noise Cancellation"
-    case off = "Off"
-    case transparency = "Transparency"
-
-    var id: String { rawValue }
-
-    var activeLabel: String {
-        switch self {
-        case .noiseCancellation: return "Noise Cancellation Active"
-        case .transparency:      return "Transparency Active"
-        case .off:               return "Noise Control Off"
-        }
-    }
-}
-
-/// A vendor-specific, *documented* BLE noise-control interface.
-///
-/// There is no Bluetooth SIG standard for ANC / Transparency, and iOS has no public API for it,
-/// so every implementation is specific to one manufacturer's GATT layout. Add a conformance only
-/// when you have the vendor's documentation, or have confirmed the service/characteristic UUIDs
-/// in the app's Bluetooth Report on the real earbuds. Do NOT guess UUIDs.
-protocol EarbudNoiseProvider: AnyObject {
-    /// True only when the discovered GATT layout is exactly the interface this provider implements.
-    static func matches(services: [CBService]) -> Bool
-    init(peripheral: CBPeripheral, services: [CBService])
-
-    var supportedModes: [EarbudNoiseMode] { get }
-    /// Called with the mode the DEVICE reports (read-back or notification), never with an assumed one.
-    var onModeChange: ((EarbudNoiseMode?) -> Void)? { get set }
-
-    /// Subscribe and/or read the current state.
-    func start()
-    /// Write the requested mode. The UI only changes when the device reports the new mode back.
-    func set(_ mode: EarbudNoiseMode)
-    /// Offer every characteristic update; return true if it was consumed.
-    func handle(update characteristic: CBCharacteristic) -> Bool
-}
-
-enum EarbudNoiseRegistry {
-    /// Intentionally empty: no vendor interface is registered, so the app will truthfully report
-    /// "Noise Control is not exposed by this device." Register real providers here.
-    static func providers() -> [any EarbudNoiseProvider.Type] { [] }
-}
-
 // MARK: - GATT report types
 
 struct GATTCharacteristicInfo: Identifiable {

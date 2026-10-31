@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Native-style status screen. Every row is driven by real data; when the device does not
-/// expose something the screen says so instead of showing a placeholder value.
+/// Every row is driven by data the earbuds actually returned. When something isn't available the screen says
+/// exactly why (no BLE link, service missing, no reply, reply not understood) instead of a generic "not supported".
 struct EarbudStatusView: View {
     @ObservedObject var hub: EarbudHub
 
@@ -14,14 +14,25 @@ struct EarbudStatusView: View {
                 deviceSection
                 Section {
                     NavigationLink("Bluetooth Report") { BluetoothReportView(text: hub.reportText) }
+                } footer: {
+                    Text("Lists every service the earbuds expose plus an event log. Review it before sharing.")
                 }
             }
             .navigationTitle("Earbuds")
-            .onAppear { hub.start() }
+            .onAppear { hub.screenAppeared() }
+            .onDisappear { hub.screenDisappeared() }
         }
     }
 
-    // MARK: Connection
+    // MARK: Connection (three separate facts)
+
+    private var canRetry: Bool {
+        if hub.controlReady { return false }
+        switch hub.ble.connection {
+        case .bluetoothOff, .unauthorized, .unsupported: return false
+        default: return true
+        }
+    }
 
     private var connectionSection: some View {
         Section {
@@ -38,55 +49,76 @@ struct EarbudStatusView: View {
                     }
                 }
             }
-            LabeledContent("Audio output", value: hub.routeDescription)
-            LabeledContent("Bluetooth LE", value: hub.bleDescription)
+            LabeledContent("Audio", value: hub.audioDescription)
+            LabeledContent("Bluetooth LE link", value: hub.bleLinkDescription)
+            LabeledContent("BLE control", value: hub.controlDescription)
 
-            if !hub.bleConnected, !hub.ble.candidates.isEmpty {
+            if hub.isConnected, let reason = hub.controlDiagnosis {
+                Text(reason).font(.footnote).foregroundStyle(.secondary)
+            }
+            if !hub.bleLinked, !hub.ble.candidates.isEmpty {
                 ForEach(hub.ble.candidates) { c in
                     Button("Use \(c.name) for battery and controls") { hub.ble.select(c) }
                 }
             }
-            if !hub.bleConnected {
+            if canRetry {
+                Button("Retry") { hub.retryControl() }
+            }
+            if !hub.bleLinked {
                 Button("Search for earbuds again") { hub.ble.rescan() }
             }
             if let message = hub.ble.errorMessage {
-                Text(message).font(.footnote).foregroundStyle(.secondary)
+                Text(message).font(.footnote).foregroundStyle(.orange)
             }
+        } header: {
+            Text("Connection")
         }
     }
 
     // MARK: Battery
 
-    @ViewBuilder private var batterySection: some View {
-        Section("Battery") {
-            switch hub.ble.batteryAvailability {
-            case .checking:
-                if hub.bleConnected {
-                    Label("Reading…", systemImage: "hourglass").foregroundStyle(.secondary)
-                } else if hub.isConnected {
-                    Text("Waiting for a Bluetooth LE link to the earbuds.").foregroundStyle(.secondary)
-                } else {
-                    Text("Connect your earbuds to read battery.").foregroundStyle(.secondary)
-                }
-            case .notExposed:
-                Text("Battery information is not exposed by this device.").foregroundStyle(.secondary)
-            case .failed(let message):
-                Text("Couldn't read battery: \(message)").foregroundStyle(.secondary)
-            case .supported:
-                ForEach(hub.ble.batteries) { b in
-                    LabeledContent(b.role.title) {
-                        HStack(spacing: 4) {
-                            if b.charging == true { Image(systemName: "bolt.fill").foregroundStyle(.green) }
-                            Text(b.percent.map { "\($0)%" } ?? "…")
-                        }
+    @ViewBuilder private var standardBatteryRows: some View {
+        if hub.ble.batteryAvailability == .supported {
+            ForEach(hub.ble.batteries) { b in
+                LabeledContent(b.role.title) {
+                    HStack(spacing: 4) {
+                        if b.charging == true { Image(systemName: "bolt.fill").foregroundStyle(.green) }
+                        Text(b.percent.map { "\($0)%" } ?? "…")
                     }
                 }
-                if hub.ble.batteries.contains(where: { $0.role == .combined }) {
-                    Text("These earbuds report a single battery value.").font(.footnote).foregroundStyle(.secondary)
-                }
-                if hub.ble.batteries.contains(where: { $0.role == .unlabeled }) {
-                    Text("The device doesn't say which battery is which, so they are not labeled left, right, or case.")
-                        .font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func controlBatteryRow(_ title: String, _ value: OPOBatteryMonitor.Value?) -> some View {
+        LabeledContent(title) {
+            HStack(spacing: 4) {
+                if value?.charging == true { Image(systemName: "bolt.fill").foregroundStyle(.green) }
+                Text(value.map { "\($0.percent)%" } ?? "Not available")
+            }
+        }
+    }
+
+    @ViewBuilder private var batterySection: some View {
+        Section("Battery") {
+            switch hub.battery.status {
+            case .ready:
+                controlBatteryRow("Left Earbud", hub.battery.left)
+                controlBatteryRow("Right Earbud", hub.battery.right)
+                controlBatteryRow("Charging Case", hub.battery.caseValue)
+                Text("Read from the earbuds' control channel. The reply layout for this model is community-documented and not yet confirmed on your unit, so compare these once with HeyMelody.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            case .idle, .loading:
+                Label("Loading…", systemImage: "hourglass").foregroundStyle(.secondary)
+            case .failed(let message):
+                Text(message).foregroundStyle(.orange)
+                standardBatteryRows
+            case .unavailable(let reason):
+                if hub.ble.batteryAvailability == .supported {
+                    standardBatteryRows
+                } else {
+                    Text("Not available").foregroundStyle(.secondary)
+                    Text(reason).font(.footnote).foregroundStyle(.secondary)
                 }
             }
         }
@@ -94,29 +126,45 @@ struct EarbudStatusView: View {
 
     // MARK: Noise control
 
+    private var isChangingNoise: Bool {
+        if case .changing = hub.noise.status { return true }
+        return false
+    }
+
+    @ViewBuilder private var noiseControls: some View {
+        Picker("Mode", selection: Binding<OPONoiseMode?>(
+            get: { hub.noise.mode },
+            set: { if let mode = $0 { hub.noise.set(mode) } }
+        )) {
+            ForEach(OPONoiseMode.allCases) { mode in Text(mode.shortLabel).tag(Optional(mode)) }
+        }
+        .pickerStyle(.segmented)
+        .disabled(isChangingNoise)
+
+        if case .changing(let target) = hub.noise.status {
+            Label("Changing to \(target.shortLabel)…", systemImage: "hourglass").foregroundStyle(.secondary)
+        } else if let mode = hub.noise.mode {
+            Text(mode.activeLabel)
+        } else {
+            Text("The earbuds haven't reported their current mode.").foregroundStyle(.secondary)
+        }
+        if case .failed(let message) = hub.noise.status {
+            Text(message).foregroundStyle(.orange)
+        }
+        Text("ANC levels (Mild, Moderate, Max, Smart) are not offered: no verified command values exist for this model, so none are sent.")
+            .font(.footnote).foregroundStyle(.secondary)
+    }
+
     @ViewBuilder private var noiseSection: some View {
         Section("Noise Control") {
-            switch hub.ble.noiseAvailability {
-            case .checking:
-                Text(hub.bleConnected ? "Checking…" : "Connect your earbuds to check.")
-                    .foregroundStyle(.secondary)
-            case .notExposed:
-                Text("Noise Control is not exposed by this device.").foregroundStyle(.secondary)
-            case .failed(let message):
-                Text("Couldn't check noise control: \(message)").foregroundStyle(.secondary)
-            case .supported:
-                Picker("Mode", selection: Binding<EarbudNoiseMode?>(
-                    get: { hub.ble.currentNoiseMode },
-                    set: { if let mode = $0 { hub.ble.setNoiseMode(mode) } }
-                )) {
-                    ForEach(hub.ble.noiseModes) { mode in Text(mode.rawValue).tag(Optional(mode)) }
-                }
-                .pickerStyle(.segmented)
-                if let mode = hub.ble.currentNoiseMode {
-                    Text(mode.activeLabel)
-                } else {
-                    Text("The earbuds haven't reported their current mode.").foregroundStyle(.secondary)
-                }
+            switch hub.noise.status {
+            case .unavailable(let reason):
+                Text("Noise control is unavailable.").foregroundStyle(.secondary)
+                Text(reason).font(.footnote).foregroundStyle(.secondary)
+            case .idle, .reading:
+                Label("Reading current mode…", systemImage: "hourglass").foregroundStyle(.secondary)
+            case .ready, .changing, .failed:
+                noiseControls
             }
         }
     }
@@ -125,11 +173,29 @@ struct EarbudStatusView: View {
 
     @ViewBuilder private var deviceSection: some View {
         Section("Device") {
+            if let name = hub.bleDeviceName { LabeledContent("Name", value: name) }
+
+            switch hub.info.status {
+            case .ready:
+                if let firmware = hub.info.firmware {
+                    LabeledContent("Firmware", value: firmware)
+                } else {
+                    Text("The earbuds replied, but no firmware version was recognised in the reply.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                ForEach(hub.info.strings, id: \.self) { text in
+                    LabeledContent("Reply text", value: text)
+                }
+            case .idle, .loading:
+                Label("Reading firmware…", systemImage: "hourglass").foregroundStyle(.secondary)
+            case .failed(let message):
+                Text(message).font(.footnote).foregroundStyle(.secondary)
+            case .unavailable:
+                EmptyView()
+            }
+
             ForEach(BLEEarbudSession.infoOrder, id: \.self) { label in
                 if let value = hub.ble.deviceInfo[label] { LabeledContent(label, value: value) }
-            }
-            if hub.ble.discoveryComplete, hub.ble.deviceInfo.isEmpty {
-                Text("Firmware and model are not exposed by this device.").foregroundStyle(.secondary)
             }
             if let rssi = hub.ble.rssi { LabeledContent("Signal", value: "\(rssi) dBm") }
             if let seen = hub.ble.lastSeen {
