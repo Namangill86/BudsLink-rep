@@ -1,41 +1,42 @@
 import SwiftUI
 
 @main struct BudsLinkApp: App {
-    @StateObject private var bt = BluetoothManager()
+    // BluetoothManager is intentionally NOT created any more. It ran its own CBCentralManager that connected on
+    // every Bluetooth power-on and from onAppear, in parallel with EarbudHub's, and the two fought over the earbuds.
+    // EarbudHub (BLEEarbudSession -> OPOSession) is now the ONE authoritative BLE control layer.
     @StateObject private var audio = AudioManager()
     @StateObject private var monitor = ConnectionMonitor()
-      @StateObject private var live = LiveListenManager()
-    @StateObject private var noise = NoiseControlManager()
+    @StateObject private var live = LiveListenManager()
+    @StateObject private var noise = NoiseControlManager()   // legacy object, kept so any view that still reads it keeps working
     @StateObject private var hub = EarbudHub()
 
     var body: some Scene {
         WindowGroup {
             ZStack(alignment: .top) {
-              TabView {
+                TabView {
                     DashboardView().tabItem { Label("Buds", systemImage: "earbuds") }
                     LiveListenView().tabItem { Label("Live Listen", systemImage: "ear.badge.waveform") }
                     EQView().tabItem { Label("EQ", systemImage: "slider.vertical.3") }
-                    CompatibilityView().tabItem { Label("Features", systemImage: "checklist") }
+                    FeatureComparisonView().tabItem { Label("Features", systemImage: "checklist") }
                     EarbudStatusView(hub: hub).tabItem { Label("Earbuds", systemImage: "antenna.radiowaves.left.and.right") }
                 }
                 if monitor.showPopup {
-
-                    ConnectPopup(name: monitor.deviceName ?? "Earbuds", battery: bt.batteryPercent)
+                    ConnectPopup(name: monitor.deviceName ?? "Earbuds")
                         .transition(.move(edge: .top).combined(with: .opacity)).zIndex(1)
                 }
             }
             .animation(.spring(response: 0.5, dampingFraction: 0.8), value: monitor.showPopup)
-            .environmentObject(bt).environmentObject(audio)
-            .environmentObject(monitor).environmentObject(live).environmentObject(noise)
-            .onAppear { monitor.onConnect = { bt.attachToConnected() }; bt.attachToConnected() }
+            .environmentObject(audio)
+            .environmentObject(monitor).environmentObject(live).environmentObject(noise).environmentObject(hub)
+            .onAppear { monitor.onConnect = { hub.connectionDetected() }; hub.connectionDetected() }
         }
     }
 }
 
 struct ConnectPopup: View {
-    let name: String; let battery: Int?
+    let name: String
     @State private var pulse = false
-    @EnvironmentObject var noise: NoiseControlManager
+    @EnvironmentObject var hub: EarbudHub
     var body: some View {
         HStack(spacing: 14) {
             Image(systemName: "earbuds").font(.largeTitle).scaleEffect(pulse ? 1.12 : 0.95)
@@ -43,13 +44,9 @@ struct ConnectPopup: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(name).font(.headline)
                 Text("Connected").font(.subheadline).foregroundStyle(.green)
-                Text(battery.map { "Battery \($0)%" } ?? "Battery not reported by earbuds")
-                    .font(.caption).foregroundStyle(.secondary)
-                if noise.isSupported {
-                    HStack { ForEach(noise.supportedModes, id: \.self) { m in
-                        Text("\(m.icon) \(m.rawValue)").font(.caption2).padding(6)
-                            .background(noise.mode == m ? Color.accentColor : Color.secondary.opacity(0.2), in: Capsule())
-                            .foregroundStyle(noise.mode == m ? Color.white : Color.primary) } }
+                Text(hub.batterySummary).font(.caption).foregroundStyle(.secondary)
+                if let mode = hub.noise.mode {
+                    Text(mode.activeLabel).font(.caption2).foregroundStyle(.secondary)
                 }
             }
             Spacer()
@@ -60,9 +57,17 @@ struct ConnectPopup: View {
 }
 
 struct DashboardView: View {
-    @EnvironmentObject var bt: BluetoothManager
+    @EnvironmentObject var hub: EarbudHub
     @EnvironmentObject var monitor: ConnectionMonitor
-    @EnvironmentObject var noise: NoiseControlManager
+
+    private func panel<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.headline)
+            content()
+        }
+        .budsCard()
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -70,37 +75,23 @@ struct DashboardView: View {
                     VStack(spacing: 6) {
                         Text(monitor.status == .connected ? "🟢 Connected" : "⚪️ Disconnected").font(.headline)
                         Text(monitor.deviceName ?? "No earbuds detected").font(.title2.bold())
-                        if let r = bt.rssi { Text("Signal \(r) dBm").foregroundStyle(.secondary) }
+                        if let r = hub.ble.rssi { Text("Signal \(r) dBm").foregroundStyle(.secondary) }
                     }
                     .frame(maxWidth: .infinity).padding()
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
-                    BatteryCard()
-                    if let e = bt.errorMessage { Text(e).foregroundStyle(.orange).font(.callout) }
-                    Button("Scan for battery (BLE)") {
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred(); bt.startScan()
-                    }.buttonStyle(.borderedProminent)
-                    NoiseControlCard()
-                    Text("Last seen: \(bt.lastSeen?.formatted(date: .omitted, time: .shortened) ?? "never"). Not Apple's Find My network.")
+
+                    ControlStatusPanel(hub: hub).budsCard()
+                    panel("Battery") { BatteryPanel(hub: hub) }
+                    panel("Noise Control") { NoisePanel(hub: hub) }
+                    panel("Device") { DevicePanel(hub: hub) }
+
+                    Text("Last seen: \(hub.ble.lastSeen?.formatted(date: .omitted, time: .shortened) ?? "never"). Not Apple's Find My network.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }.padding()
             }.navigationTitle("BudsLink")
-                .onChange(of: bt.gattDump) { _, new in noise.detect(gatt: new) }
+                .onAppear { hub.screenAppeared() }
+                .onDisappear { hub.screenDisappeared() }
         }
-    }
-}
-
-struct BatteryCard: View {
-    @EnvironmentObject var bt: BluetoothManager
-    private func row(_ t: String, _ v: String) -> some View { HStack { Text(t); Spacer(); Text(v).foregroundStyle(.secondary) } }
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            row("Earbuds (single value)", bt.batteryPercent.map { "\($0)%" } ?? "Not available")
-            row("Left earbud", "Not exposed")
-            row("Right earbud", "Not exposed")
-            row("Charging case", "Not exposed")
-            Text("iOS doesn't give apps Classic Bluetooth battery data. Only a BLE Battery Service value can be shown, and only if the buds offer one.")
-                .font(.footnote).foregroundStyle(.secondary)
-        }.padding().background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
     }
 }
 
@@ -168,6 +159,7 @@ struct CapabilityRow: View {
     }
 }
 
+/// Legacy view, no longer shown (FeatureComparisonView replaced it). Kept compiling so nothing that referenced it breaks.
 struct CompatibilityView: View {
     var body: some View {
         NavigationStack {

@@ -132,7 +132,8 @@ final class OPOSession: ObservableObject {
         lastProfile = profile
         attempts += 1
         state = .starting("Sending HELLO")
-        OPOLog.shared.add("OPO", "Sending HELLO (attempt \(attempts) of \(maxAutoAttempts))")
+        OPOLog.shared.add("OPO", "Handshake started (attempt \(attempts) of \(maxAutoAttempts))")
+        OPOLog.shared.add("OPO", "Sending HELLO")
         let gen = generation
 
         enqueue(name: "HELLO", wire: Data(OPOCommand.hello), logLine: "HELLO \(OPOCommand.hello.hex)",
@@ -142,7 +143,7 @@ final class OPOSession: ObservableObject {
             case .failure(let e):
                 self.handshakeFailed("HELLO got no answer (\(e.message))")
             case .success:
-                OPOLog.shared.add("OPO", "HELLO response received")
+                OPOLog.shared.add("OPO", "Handshake response received (HELLO)")
                 self.state = .starting("Registering session")
                 OPOLog.shared.add("OPO", "Registering session")
                 let reg = OPOCommand.register()
@@ -157,7 +158,7 @@ final class OPOSession: ObservableObject {
                     case .success:
                         // An answer proves the control channel is alive. The first real command (ANC query)
                         // is what proves the registration was accepted, and its failure is reported there.
-                        OPOLog.shared.add("OPO", "REGISTER response received; session ready")
+                        OPOLog.shared.add("OPO", "Handshake response received (REGISTER); session ready")
                         self.state = .ready
                         self.pump()
                     }
@@ -167,7 +168,7 @@ final class OPOSession: ObservableObject {
     }
 
     private func handshakeFailed(_ detail: String) {
-        OPOLog.shared.add("OPO", "Handshake failed: \(detail)")
+        OPOLog.shared.add("OPO ERROR", "Handshake failed: \(detail)")
         if attempts < maxAutoAttempts, let profile = lastProfile {
             let delay = Double(attempts) * 3
             state = .starting("Retrying in \(Int(delay)) s")
@@ -248,7 +249,7 @@ final class OPOSession: ObservableObject {
             OPOLog.shared.add("OPO", "Timeout waiting for \(request.name); retrying")
             write(generation: gen, tries: 0)
         } else {
-            OPOLog.shared.add("OPO", "Timeout waiting for \(request.name); giving up")
+            OPOLog.shared.add("OPO ERROR", "Handshake/command timeout waiting for \(request.name); giving up")
             finish(.failure(.timeout))
         }
     }
