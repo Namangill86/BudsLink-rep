@@ -20,7 +20,21 @@ import SwiftUI
                     FeatureComparisonView().tabItem { Label("Features", systemImage: "checklist") }
                     EarbudStatusView(hub: hub).tabItem { Label("Earbuds", systemImage: "antenna.radiowaves.left.and.right") }
                 }
-                if monitor.showPopup {
+                if hub.caseManager.isPopupVisible {
+                    // Case-open popup. It lives above the TabView, so it floats over the Dashboard (and any other
+                    // tab) without covering the whole app or touching the navigation.
+                    CaseOpenPopupView(info: hub.casePopupInfo,
+                                      evidence: hub.caseManager.popupEvidence,
+                                      isPreview: hub.caseManager.isPreview,
+                                      onDismiss: { hub.caseManager.dismiss() })
+                        .id(hub.caseManager.popupID)
+                        .transition(.asymmetric(
+                            insertion: .scale(scale: 0.88).combined(with: .opacity),
+                            removal: .scale(scale: 0.94).combined(with: .opacity)))
+                        .padding(.top, 8)
+                        .zIndex(2)
+                } else if monitor.showPopup && !hub.caseManager.popupEnabled {
+                    // The original connect banner, used only when the new case popup is switched off.
                     ConnectPopup(name: monitor.deviceName ?? "Earbuds")
                         .transition(.move(edge: .top).combined(with: .opacity)).zIndex(1)
                 }

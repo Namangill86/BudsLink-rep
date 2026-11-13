@@ -240,3 +240,36 @@ struct DevicePanel: View {
         }
     }
 }
+
+// MARK: - Case-open popup settings
+
+struct CaseSettingsPanel: View {
+    @ObservedObject var hub: EarbudHub
+
+    private var stateText: String {
+        let manager = hub.caseManager
+        guard let evidence = manager.evidence else { return manager.caseState.title }
+        return manager.caseState.title + " (" + evidence.summary + ")"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Show popup when the case opens", isOn: Binding(
+                get: { hub.caseManager.popupEnabled },
+                set: { hub.caseManager.popupEnabled = $0 }
+            ))
+            Toggle("Also when the earbuds reconnect (inferred)", isOn: Binding(
+                get: { hub.caseManager.inferredTriggerEnabled },
+                set: { hub.caseManager.inferredTriggerEnabled = $0 }
+            ))
+            HStack {
+                Text("Case state")
+                Spacer()
+                Text(stateText).foregroundStyle(.secondary).multilineTextAlignment(.trailing)
+            }
+            Text("The earbuds do not report their charging-case lid in any message BudsLink can verify yet, so \"open\" is inferred: the earbuds became reachable again after being unreachable. That also happens when you take them out of the case. If the earbuds ever report the lid themselves, that signal takes over automatically.")
+                .font(.footnote).foregroundStyle(.secondary)
+            Button("Preview animation") { hub.caseManager.preview() }.buttonStyle(.bordered)
+        }
+    }
+}

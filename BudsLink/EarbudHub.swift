@@ -17,6 +17,8 @@ final class EarbudHub: ObservableObject {
     let noise: OPONoiseControl
     let battery: OPOBatteryMonitor
     let info: OPODeviceInfoManager
+    /// Single source of truth for the charging-case state and the popup (see CaseState.swift).
+    let caseManager = CaseAnimationManager()
 
     private var bag = Set<AnyCancellable>()
 
@@ -28,7 +30,8 @@ final class EarbudHub: ObservableObject {
         // Forward child changes so views that observe only the hub still refresh.
         Publishers.MergeMany([
             route.objectWillChange, ble.objectWillChange, ble.opo.objectWillChange,
-            noise.objectWillChange, battery.objectWillChange, info.objectWillChange
+            noise.objectWillChange, battery.objectWillChange, info.objectWillChange,
+            caseManager.objectWillChange
         ])
         .sink { [weak self] _ in self?.objectWillChange.send() }
         .store(in: &bag)
@@ -39,6 +42,9 @@ final class EarbudHub: ObservableObject {
             .removeDuplicates()
             .sink { [weak self] newRoute in self?.ble.start(matchingAudioRouteNamed: newRoute?.name) }
             .store(in: &bag)
+
+        // The case manager watches the same live state (audio route, BLE link, control-channel frames).
+        caseManager.bind(route: route, ble: ble)
     }
 
     /// Called by ConnectionMonitor.onConnect and by screens.

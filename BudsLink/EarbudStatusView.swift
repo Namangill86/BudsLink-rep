@@ -11,6 +11,7 @@ struct EarbudStatusView: View {
                 Section("Battery") { BatteryPanel(hub: hub) }
                 Section("Noise Control") { NoisePanel(hub: hub) }
                 Section("Device") { DevicePanel(hub: hub) }
+                Section("Case-open popup") { CaseSettingsPanel(hub: hub) }
                 Section {
                     NavigationLink("Bluetooth Report") { BluetoothReportView(hub: hub) }
                 } footer: {
